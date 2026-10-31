@@ -30,16 +30,15 @@ def get_voyage_key() -> str:
 
 
 def get_embeddings_provider() -> str:
-    """Embedding backend for embed(): 'voyage' (default) or 'ollama' (local)."""
+    """Embedding backend for embed(): 'voyage' (API, default) or 'local'
+    (sentence-transformers, runs in-process, no server/API call)."""
     return (os.environ.get("EMBEDDINGS_PROVIDER") or "voyage").strip().lower()
 
-
-def get_ollama_url() -> str:
-    return os.environ.get("OLLAMA_URL") or "http://localhost:11434"
-
-
-def get_ollama_embed_model() -> str:
-    return os.environ.get("OLLAMA_EMBED_MODEL") or "mxbai-embed-large"
+def get_local_embed_model() -> str:
+    """Hugging Face model id loaded in-process by the 'local' backend.
+    Override via LOCAL_EMBED_MODEL if you want a different model; defaults to
+    mxbai-embed-large-v1 (1024-dim, matches schema.sql's vector(1024))."""
+    return os.environ.get("LOCAL_EMBED_MODEL") or "mixedbread-ai/mxbai-embed-large-v1"
 
 
 def connect() -> psycopg.Connection:

@@ -29,7 +29,7 @@ def _install_fake(monkeypatch):
     monkeypatch.setattr(embeddings, "get_voyage_key", lambda: "test-key")
     monkeypatch.setattr(embeddings.voyageai, "Client", lambda *a, **k: fake)
     # Reset any module-level cached client so the patched constructor is used.
-    monkeypatch.setattr(embeddings, "_client", None, raising=False)
+    monkeypatch.setattr(embeddings, "_voyage_client", None, raising=False)
     return fake
 
 
@@ -70,53 +70,52 @@ def test_embed_empty_list_returns_empty_without_calling_client(monkeypatch):
     assert fake.calls == []
 
 
-# ---- local Ollama backend (EMBEDDINGS_PROVIDER=ollama) -------------------------
+# ---- local backend (EMBEDDINGS_PROVIDER=local) ---------------------------------
 
-class _FakeResp:
-    def __init__(self, vec):
-        self._vec = vec
+class _FakeSTModel:
+    """Stands in for SentenceTransformer; records the (prefixed) inputs."""
 
-    def raise_for_status(self):
-        pass
+    def __init__(self, dim=1024):
+        self.dim = dim
+        self.inputs = []
 
-    def json(self):
-        return {"embedding": self._vec}
-
-
-def _install_fake_ollama(monkeypatch, dim=1024):
-    """Route embed() to the ollama backend and stub the HTTP call (no network)."""
-    monkeypatch.setenv("EMBEDDINGS_PROVIDER", "ollama")
-    calls = []
-
-    def fake_post(url, json=None, timeout=None):
-        calls.append({"url": url, "json": json})
-        return _FakeResp([0.1] * dim)
-
-    monkeypatch.setattr(embeddings.requests, "post", fake_post)
-    return calls
+    def encode(self, texts, normalize_embeddings=False):
+        self.inputs.extend(texts)
+        return [[0.1] * self.dim for _ in texts]
 
 
-def test_embed_ollama_routes_and_returns_1024(monkeypatch):
-    calls = _install_fake_ollama(monkeypatch)
+def _install_fake_local(monkeypatch, dim=1024, model="intfloat/multilingual-e5-large"):
+    monkeypatch.setenv("EMBEDDINGS_PROVIDER", "local")
+    monkeypatch.setenv("LOCAL_EMBED_MODEL", model)
+    fake = _FakeSTModel(dim)
+    monkeypatch.setattr(embeddings, "_get_local_model", lambda: fake)
+    return fake
+
+
+def test_embed_local_routes_and_returns_1024(monkeypatch):
+    fake = _install_fake_local(monkeypatch)
     out = embeddings.embed(["a", "b"])
     assert len(out) == 2
     assert all(len(v) == 1024 for v in out)
-    assert len(calls) == 2
-    assert all(c["json"]["model"] == "mxbai-embed-large" for c in calls)
-    assert calls[0]["json"]["prompt"] == "a"  # documents carry no query prefix
+    assert fake.inputs == ["passage: a", "passage: b"]
 
 
-def test_embed_ollama_applies_query_prefix(monkeypatch):
-    calls = _install_fake_ollama(monkeypatch)
+def test_embed_local_applies_e5_query_prefix(monkeypatch):
+    fake = _install_fake_local(monkeypatch)
     embeddings.embed(["seizure device"], input_type="query")
-    assert calls[0]["json"]["prompt"].startswith(
-        "Represent this sentence for searching relevant passages: "
-    )
-    assert calls[0]["json"]["prompt"].endswith("seizure device")
+    assert fake.inputs == ["query: seizure device"]
 
 
-def test_embed_ollama_rejects_wrong_dim(monkeypatch):
-    _install_fake_ollama(monkeypatch, dim=768)
+def test_embed_local_mxbai_prefix_only_for_queries(monkeypatch):
+    fake = _install_fake_local(monkeypatch, model="mixedbread-ai/mxbai-embed-large-v1")
+    embeddings.embed(["doc"])
+    embeddings.embed(["q"], input_type="query")
+    assert fake.inputs[0] == "doc"
+    assert fake.inputs[1].startswith("Represent this sentence for searching relevant passages: ")
+
+
+def test_embed_local_rejects_wrong_dim(monkeypatch):
+    _install_fake_local(monkeypatch, dim=768)
     try:
         embeddings.embed(["a"])
         assert False, "expected ValueError on dim mismatch"
