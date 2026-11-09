@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Optional
 from uuid import uuid4
 
@@ -14,8 +15,30 @@ def _new_claim_id() -> str:
     return "clm_" + uuid4().hex
 
 
-def _insert_claims(conn, company_id, source_id, claims, writer):
+def _existing_active_ids(conn, company_id, source_id, claims) -> list:
+    """For each claim, the id of an identical ACTIVE claim already stored for
+    this (company, source), else None. Lets re-ingests skip embedding."""
+    if source_id is None:
+        return [None] * len(claims)
+    with conn.cursor() as cur:
+        cur.execute(
+            "select id, coalesce(field, ''), md5(value) from claims "
+            "where company_id = %s and source_id = %s and status = 'active'",
+            (company_id, source_id),
+        )
+        existing = {(f, h): cid for cid, f, h in cur.fetchall()}
+    if not existing:
+        return [None] * len(claims)
+    return [existing.get((c.field or "", hashlib.md5(c.value.encode("utf-8")).hexdigest())) for c in claims]
+
+
+def _insert_claims(conn, company_id, source_id, claims, writer, *, period_id=None, run_id=None, as_of=None):
     """Insert claims idempotently WITHOUT committing. Returns claim ids.
+
+    period_id / run_id / as_of tag NEW rows (migration 001); they are only sent
+    when given, so callers that don't pass them work on an un-migrated DB.
+    Claims that already exist (active, same company/field/value/source) return
+    the existing id without being re-embedded.
 
     The embed call site is ALWAYS the module attr `embeddings.embed(...)` so a
     single test patch of `kg.embeddings.embed` intercepts every caller. There is
@@ -32,12 +55,21 @@ def _insert_claims(conn, company_id, source_id, claims, writer):
     if not claims:
         return []
 
-    values = [c.value for c in claims]
-    vectors = embeddings.embed(values)
+    known = _existing_active_ids(conn, company_id, source_id, claims)
+    to_embed = [c.value for c, k in zip(claims, known) if k is None]
+    vec_iter = iter(embeddings.embed(to_embed) if to_embed else [])
+
+    extra_cols = [(col, val) for col, val in (("period_id", period_id), ("run_id", run_id), ("as_of", as_of)) if val is not None]
+    extra_names = "".join(f", {col}" for col, _ in extra_cols)
+    extra_marks = ", %s" * len(extra_cols)
 
     out: list[str] = []
     with conn.cursor() as cur:
-        for claim, vec in zip(claims, vectors):
+        for claim, known_id in zip(claims, known):
+            if known_id is not None:
+                out.append(known_id)
+                continue
+            vec = next(vec_iter)
             new_id = _new_claim_id()
             cur.execute(
                 # The ON CONFLICT target+predicate below MUST mirror the schema's
@@ -46,11 +78,11 @@ def _insert_claims(conn, company_id, source_id, claims, writer):
                 # and predicate  WHERE status = 'active'  EXACTLY. Any divergence
                 # makes Postgres raise: "there is no unique or exclusion constraint
                 # matching the ON CONFLICT specification".
-                """
+                f"""
                 insert into claims
-                    (id, company_id, field, value, source_id, writer, confidence, embedding, status)
+                    (id, company_id, field, value, source_id, writer, confidence, embedding, status{extra_names})
                 values
-                    (%s, %s, %s, %s, %s, %s, %s, %s, 'active')
+                    (%s, %s, %s, %s, %s, %s, %s, %s, 'active'{extra_marks})
                 on conflict (company_id, coalesce(field,''), md5(value), source_id)
                     where status = 'active'
                 do nothing
@@ -65,6 +97,7 @@ def _insert_claims(conn, company_id, source_id, claims, writer):
                     writer,
                     claim.confidence,
                     Vector(vec),
+                    *(val for _, val in extra_cols),
                 ),
             )
             row = cur.fetchone()

@@ -20,8 +20,9 @@ def raw_conn():
     conn.autocommit = True
     with conn.cursor() as cur:
         cur.execute(
-            "drop table if exists claims, sources, "
-            "company_appearances, companies cascade"
+            "drop table if exists claims, sources, documents, company_aliases, "
+            "company_appearances, companies, ingest_runs, periods, "
+            "schema_migrations cascade"
         )
     try:
         yield conn

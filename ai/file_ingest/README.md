@@ -1,0 +1,36 @@
+# File ingest (weekly CompanyFiles → kg)
+
+Phase 1–2 of [docs/ingestion-plan.md](../../docs/ingestion-plan.md): reads every company file under the event folders, writes searchable text chunks (and, with Claude, structured fields) to the kg database, and tags every row with its company, source file, event period and ingest run.
+
+## What a run does
+- **Scan.** It walks `<Event>/<Company>/...`, or `<Event>/<Category>/<Company>/...` for nested layouts (see `ai/airtable_ingest/events.py`). Each file is checked against the `documents` table: an unchanged file is skipped without being re-hashed, a new or changed file is ingested, and a missing file is retired.
+- **Extract.** Text comes out of pdf, pptx, docx, txt/md, xlsx and csv files. Video/audio files and files over `--max-file-mb` are recorded as `skipped_large`, and other file types as `unsupported`.
+- **Write.** Each file is written in one transaction and gets exactly one source. Claims that didn't change are kept, without re-embedding. Claims that are no longer in the file are marked `superseded`, so history stays in the database.
+- **Errors.** A file that fails is recorded with `status='error'` and retried on the next run. It never stops the run.
+
+## Commands
+```bash
+# 1. Database schema (local test DB; Supabase needs --yes-live + a backup first)
+python scripts/kg_apply_schema.py --db-url postgresql://postgres:postgres@localhost:5432/hunniwell_test
+
+# 2. See what would be ingested (writes nothing)
+python -m ai.file_ingest.run --root "<CompanyFiles>" --event "<Event folder>" --dry-run
+
+# 3. Ingest one event into the local DB (add --no-llm to skip Claude)
+python -m ai.file_ingest.run --root "<CompanyFiles>" --event "<Event folder>" \
+    --db-url postgresql://postgres:postgres@localhost:5432/hunniwell_test
+
+# 4. Run it again: it reports 0 new claims and every file unchanged
+
+# 5. Ask questions over what was ingested
+TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/hunniwell_test \
+    python -m ai.kg_query.cli "what did we learn in meetings with <company>?"
+```
+
+Writing to a database that isn't local (Supabase) is refused unless you pass `--yes-live`.
+
+## Tests
+```bash
+python -m pytest tests/file_ingest/test_units.py -q   # no database
+python -m pytest tests/file_ingest tests/kg tests/kg_query -q   # local Docker Postgres
+```

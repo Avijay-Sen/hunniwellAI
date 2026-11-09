@@ -50,7 +50,11 @@ def conn(monkeypatch):
     c = connect()
     apply_schema(c)
     yield c
-    c.close()
+    # run_ask monkeypatches c.close to a no-op and that patch is still active
+    # here, so close via the class: a leaked "idle in transaction" connection
+    # holds locks that block later schema changes (and hangs the suite).
+    c.rollback()
+    type(c).close(c)
 
 
 @pytest.fixture()

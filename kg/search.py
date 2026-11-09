@@ -11,7 +11,12 @@ def semantic_search(
     text: str,
     k: int = 10,
     company_id: Optional[str] = None,
+    *,
+    period_id: Optional[str] = None,
+    include_superseded: bool = False,
 ) -> list[Claim]:
+    """Nearest claims to ``text``. Active claims only unless
+    ``include_superseded`` (history); ``period_id`` needs migration 001."""
     # REAL BUG FIX: embed via the module attr so the test's
     # monkeypatch.setattr("kg.embeddings.embed", fake) intercepts this call and
     # no Voyage network request is made. Do NOT use `from kg.embeddings import embed`.
@@ -32,10 +37,14 @@ def semantic_search(
             s.kind
         from claims c
         left join sources s on s.id = c.source_id
-        where c.status = 'active'
-          and c.embedding is not null
+        where c.embedding is not null
     """
     params: list = []
+    if not include_superseded:
+        sql += " and c.status = 'active'"
+    if period_id is not None:
+        sql += " and c.period_id = %s"
+        params.append(period_id)
     if company_id is not None:
         sql += " and c.company_id = %s"
         params.append(company_id)

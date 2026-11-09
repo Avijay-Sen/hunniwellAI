@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Stand up the kg/ schema on a target Postgres (local Docker or your own Supabase).
 
-Enables the pgvector extension and creates the 4 kg tables (idempotent — safe to re-run).
+Enables the pgvector extension, creates the kg tables and applies every
+kg/migrations file (idempotent — safe to re-run).
 
 Usage:
-    # uses TEST_DATABASE_URL, then SUPABASE_DB_URL, from your .env:
+    # uses TEST_DATABASE_URL, then SUPABASE_DB_URL, from your .env
+    # (a non-local database also needs --yes-live; take a backup first):
     python scripts/kg_apply_schema.py
 
     # or target an explicit database:
@@ -33,17 +35,24 @@ EXPECTED = {"companies", "company_appearances", "sources", "claims"}
 def main() -> None:
     ap = argparse.ArgumentParser(description="Apply kg/schema.sql (enables pgvector) to a Postgres DB.")
     ap.add_argument("--db-url", help="Target DB URL. Defaults to TEST_DATABASE_URL then SUPABASE_DB_URL from .env.")
+    ap.add_argument("--yes-live", action="store_true",
+                    help="Required to change a non-local database (e.g. Supabase). Take a backup first.")
     args = ap.parse_args()
 
     url = args.db_url or get_db_url()
     where = url.split("@", 1)[1] if "@" in url else url  # never print the password
-    print(f"Applying kg schema to ...@{where}")
+    host = where.split("/", 1)[0].rsplit(":", 1)[0]
+    if host not in ("localhost", "127.0.0.1") and not args.yes_live:
+        print(f"Refusing to change non-local database {host} without --yes-live.")
+        sys.exit(2)
+    print(f"Applying kg schema + migrations to ...@{where}")
 
     conn = psycopg.connect(url, connect_timeout=20)
     conn.execute("create extension if not exists vector")
     conn.commit()
     register_vector(conn)
-    apply_schema(conn)
+    newly = apply_schema(conn)
+    print("Migrations applied now:", newly or "none (already up to date)")
     have = {r[0] for r in conn.execute(
         "select tablename from pg_tables where schemaname='public'").fetchall()} & EXPECTED
     conn.close()
