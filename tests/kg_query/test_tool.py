@@ -145,6 +145,20 @@ def test_finalize_flags_malformed_citation_tokens(conn, bad):
     assert result.citations == {}
 
 
+def test_finalize_repairs_doubled_prefix(conn, seeded_company):
+    claim_id = seeded_company["claim_id"]
+    result = kg_query_tool._finalize(conn, f"Fact [[clm_{claim_id}]]", allowed_ids={claim_id})
+    assert claim_id in result.citations
+    assert result.unverified_citations == []
+    assert f"[[{claim_id}]]" in result.answer
+
+
+def test_finalize_doubled_prefix_on_fake_id_still_flagged(conn):
+    fake = "clm_" + "0" * 32
+    result = kg_query_tool._finalize(conn, f"Fact [[clm_{fake}]]")
+    assert fake in result.unverified_citations
+
+
 def test_finalize_deduplicates_repeated_citations(conn, seeded_company):
     claim_id = seeded_company["claim_id"]
     text = f"First mention [[{claim_id}]]. Second mention [[{claim_id}]]."

@@ -4,6 +4,7 @@ so claims from files and from Airtable line up per field."""
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import anthropic
@@ -11,10 +12,14 @@ import anthropic
 from ai.airtable_ingest.ingest import FIELD_MAP, _coerce_value, _strip_fences
 from kg.models import ClaimInput
 
-MODEL = "claude-haiku-4-5-20251001"
+# Sonnet, not Haiku: on the demo set Haiku confused round size / equity raised /
+# close date; Sonnet got them right. Override with FILE_INGEST_MODEL.
+MODEL = os.environ.get("FILE_INGEST_MODEL") or "claude-sonnet-4-6"
 MAX_INPUT_CHARS = 30_000
 
 FIELD_KEYS = [k for k in FIELD_MAP if k not in ("company", "event", "data_entry")]
+# Values the model sometimes emits instead of omitting a key.
+_PLACEHOLDERS = {"0", "0.0", "0.00", "n/a", "na", "none", "unknown", "not stated", "not specified", "-", "tbd"}
 
 SYSTEM_PROMPT = f"""You extract facts about ONE medtech company from the text of a single \
 file (a pitch deck, meeting notes, a spreadsheet, a report). Return ONLY a JSON object, no \
@@ -24,8 +29,15 @@ Allowed keys (all values are strings): {", ".join(FIELD_KEYS)}.
 
 Rules:
 - Include a key only if THIS text clearly states it. Never infer, guess, or use outside knowledge.
+  Never output placeholders such as "0", "N/A", "none" or "unknown" — omit the key instead.
 - Be concise: phrases, not paragraphs. Keep exact numbers, units and dates as written.
-- equity_raised_m and size_of_round_m: decimal millions (e.g. "2.5"). est_close: MM/YYYY.
+- Funding keys are easy to confuse; use these definitions exactly:
+  - coming_round: the NAME of the round being raised now or next, as stated (e.g. "Seed", \
+"Series A"). Never infer a later round from plans or term sheets.
+  - size_of_round_m: the target size of that round, decimal $ millions (e.g. "6.0").
+  - equity_raised_m: total equity the company has ALREADY CLOSED to date, decimal $ millions. \
+Round targets, soft-circled, committed or "leading with" amounts are NOT equity raised.
+  - est_close: expected close of the round, MM/YYYY. Never use regulatory, product or study dates.
 - medical_field and indication: comma-separated if several apply.
 - company_notes: only high-signal diligence facts not covered by other keys (investors, \
 grants, IP, awards, feedback from meetings).
@@ -75,6 +87,6 @@ def extract_field_claims(
     out: list[ClaimInput] = []
     for key in FIELD_KEYS:
         value = _coerce_value(data.get(key))
-        if value:
+        if value and value.strip().lower() not in _PLACEHOLDERS:
             out.append(ClaimInput(field=key, value=value))
     return out

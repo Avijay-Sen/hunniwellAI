@@ -160,11 +160,13 @@ def record_error(conn, entry: FileEntry, err: Exception, *, run_id: str, period_
 
 
 def print_plan(scan: ScanResult, max_bytes: int) -> None:
-    by_kind = Counter(file_kind(e.path) for e in scan.to_ingest)
     skipped = Counter(is_skipped(e, max_bytes) for e in scan.to_ingest if is_skipped(e, max_bytes))
     ingestable = [e for e in scan.to_ingest if not is_skipped(e, max_bytes)]
-    companies = {e.company_relpath for e in scan.new + scan.changed + scan.unchanged}
-    print(f"Events: {len(scan.event_folders)}  Companies: {len(companies)}")
+    by_kind = Counter(file_kind(e.path) for e in ingestable)
+    every = scan.new + scan.changed + scan.unchanged
+    folders = {e.company_relpath for e in every}
+    names = {e.company_name for e in every}
+    print(f"Events: {len(scan.event_folders)}  Companies: {len(names)} ({len(folders)} company folders)")
     print(f"Files: new={len(scan.new)} changed={len(scan.changed)} "
           f"unchanged={len(scan.unchanged)} deleted={len(scan.deleted_relpaths)}")
     print(f"To ingest: {len(ingestable)} files  by type: {dict(by_kind)}")

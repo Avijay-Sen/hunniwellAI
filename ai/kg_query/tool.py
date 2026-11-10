@@ -32,6 +32,9 @@ _CITATION_RE = re.compile(r"\[\[(clm_[0-9a-f]{32})\]\]")
 # Looser net for anything that *looks like* a citation attempt, so a malformed
 # token (uppercase hex, truncated id, ...) is flagged instead of silently ignored.
 _CITATION_ATTEMPT_RE = re.compile(r"\[\[\s*(clm_[^\]\s]*)\s*\]\]", re.IGNORECASE)
+# The model occasionally doubles the prefix: [[clm_clm_<hex>]]. Collapsing it
+# is safe because the repaired id still has to pass every check in _finalize.
+_DOUBLED_PREFIX_RE = re.compile(r"\[\[(\s*)(?:clm_){2,}")
 # A citation cut off by the token limit: "[[clm_2ae30..." with no closing "]]".
 _DANGLING_CITATION_RE = re.compile(r"\[\[\s*clm_[^\]\s]*\s*$", re.IGNORECASE)
 
@@ -123,6 +126,7 @@ def _finalize(conn, answer_text: str, allowed_ids: set[str] | None = None) -> As
 
     Citation-looking tokens that are malformed are reported as unverified too,
     rather than being silently ignored."""
+    answer_text = _DOUBLED_PREFIX_RE.sub(r"[[\1clm_", answer_text)
     attempts: list[str] = []
     for t in _CITATION_ATTEMPT_RE.findall(answer_text):
         if t not in attempts:

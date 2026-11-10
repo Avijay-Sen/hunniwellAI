@@ -12,7 +12,7 @@ from pathlib import Path
 from ai.airtable_ingest.ingest import EXTRACTORS as _BASE_EXTRACTORS
 
 # Bump when extraction/chunking changes, so a run can re-ingest everything.
-EXTRACTOR_VERSION = "1"
+EXTRACTOR_VERSION = "2"
 
 MAX_SHEET_ROWS = 2_000
 MAX_TEXT_CHARS = 400_000
