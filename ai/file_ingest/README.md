@@ -6,6 +6,7 @@ Phase 1–2 of [docs/ingestion-plan.md](../../docs/ingestion-plan.md): reads eve
 - **Scan.** It walks `<Event>/<Company>/...`, or `<Event>/<Category>/<Company>/...` for nested layouts (see `ai/airtable_ingest/events.py`). Each file is checked against the `documents` table: an unchanged file is skipped without being re-hashed, a new or changed file is ingested, and a missing file is retired.
 - **Extract.** Text comes out of pdf, pptx, docx, txt/md, xlsx and csv files. Video/audio files and files over `--max-file-mb` are recorded as `skipped_large`, and other file types as `unsupported`.
 - **Write.** Each file is written in one transaction and gets exactly one source. Claims that didn't change are kept, without re-embedding. Claims that are no longer in the file are marked `superseded`, so history stays in the database.
+- **Company names.** A folder name that matches an existing company exactly (ignoring case, spacing, punctuation and Inc/LLC) or through an alias is used as is. A name close to an existing company but not the same (e.g. "Acme Health AI" vs "Acme Health") goes on a review list and its files wait; a name close to nothing becomes a new company. The dry run lists both.
 - **Errors.** A file that fails is recorded with `status='error'` and retried on the next run. It never stops the run.
 
 ## Commands
@@ -22,12 +23,24 @@ python -m ai.file_ingest.run --root "<CompanyFiles>" --event "<Event folder>" \
 
 # 4. Run it again: it reports 0 new claims and every file unchanged
 
-# 5. Ask questions over what was ingested
+# 5. Decide on names held for review, then run again to ingest their files
+python scripts/review_unmatched.py                          # list
+python scripts/review_unmatched.py --alias "Acme Health AI"  # same company as suggested
+python scripts/review_unmatched.py --new "Acme Health AI"    # a different company
+
+# 6. Ask questions over what was ingested
 TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/hunniwell_test \
     python -m ai.kg_query.cli "what did we learn in meetings with <company>?"
 ```
 
 Writing to a database that isn't local (Supabase) is refused unless you pass `--yes-live`.
+
+## Before migrating Supabase
+Export the four kg tables from the Supabase table editor as CSV, then rehearse on a local copy (never connects to Supabase):
+```bash
+python scripts/rehearse_migration.py --csv-dir "~/Downloads/Supabase Schema"
+```
+It loads the exports into `hunniwell_rehearsal` with the original schema, applies the migrations twice and checks row counts, the claims dedup key, row-level security, company names and search.
 
 ## Tests
 ```bash

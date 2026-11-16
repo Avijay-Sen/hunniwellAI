@@ -26,7 +26,7 @@ TEST_DATABASE_URL = os.environ.get(
     "postgresql://postgres:postgres@localhost:5432/hunniwell_test",
 )
 _TABLES = (
-    "claims", "sources", "documents", "company_aliases", "company_appearances",
+    "claims", "sources", "documents", "company_aliases", "ingest_unmatched", "company_appearances",
     "companies", "ingest_runs", "periods",
 )
 EVENT = "Demo Event (260115)"
@@ -246,6 +246,129 @@ def test_aliases_merge_company_spellings(conn, root):
               acme_id)[0][0] == 2
 
 
+LATER = "Later Event (260601)"
+
+
+def _add_company_folder(root, event, name, text):
+    d = root / event / name
+    d.mkdir(parents=True)
+    (d / "notes.txt").write_text(text)
+
+
+def test_near_miss_name_is_held_for_review_not_created(conn, root):
+    _run(conn, root)
+    _add_company_folder(root, LATER, "Acme Health AI", "Acme Health AI raised a 7M Series A.")
+    stats = run_mod.run(conn, root, events=[LATER], use_llm=False, log=lambda *_: None)
+
+    assert stats["companies_held_for_review"] == 1
+    assert stats["files_held_for_review"] == 1
+    assert stats["status"] == "succeeded"
+    assert _q(conn, "select count(*) from companies")[0][0] == 2  # no near-duplicate company
+    assert _q(conn, "select count(*) from documents where relpath like %s", LATER + "%")[0][0] == 0
+    row = _q(conn, "select u.name_raw, c.name_raw, u.status from ingest_unmatched u "
+                   "join companies c on c.id = u.candidate_company_id")[0]
+    assert row == ("Acme Health AI", "Acme Health", "pending")
+
+    # still held on the next run, and still listed once
+    stats = run_mod.run(conn, root, events=[LATER], use_llm=False, log=lambda *_: None)
+    assert stats["files_held_for_review"] == 1
+    assert _q(conn, "select count(*) from ingest_unmatched")[0][0] == 1
+
+
+def test_review_alias_then_ingest_merges_into_existing_company(conn, root):
+    from kg.companies import approve_alias
+
+    _run(conn, root)
+    _add_company_folder(root, LATER, "Acme Health AI", "Acme Health AI raised a 7M Series A.")
+    run_mod.run(conn, root, events=[LATER], use_llm=False, log=lambda *_: None)
+    acme = str(_q(conn, "select id from companies where name_raw = 'Acme Health'")[0][0])
+
+    assert approve_alias(conn, "Acme Health AI") == acme
+    stats = run_mod.run(conn, root, events=[LATER], use_llm=False, log=lambda *_: None)
+    assert stats["files_ingested"] == 1
+    assert _q(conn, "select count(*) from companies")[0][0] == 2
+    assert _q(conn, "select company_id::text from documents where relpath like %s", LATER + "%")[0][0] == acme
+    assert _q(conn, "select status from ingest_unmatched")[0][0] == "aliased"
+
+
+def test_review_new_then_ingest_creates_company(conn, root):
+    from kg.companies import approve_new
+
+    _run(conn, root)
+    _add_company_folder(root, LATER, "Acme Health AI", "A different company.")
+    run_mod.run(conn, root, events=[LATER], use_llm=False, log=lambda *_: None)
+
+    approve_new(conn, "Acme Health AI")
+    stats = run_mod.run(conn, root, events=[LATER], use_llm=False, log=lambda *_: None)
+    assert stats["files_ingested"] == 1
+    assert stats["companies_created"] == 1
+    assert _q(conn, "select count(*) from companies")[0][0] == 3
+
+
+def test_unrelated_new_name_is_created_without_review(conn, root):
+    _run(conn, root)
+    _add_company_folder(root, LATER, "Zeta Neuro", "Zeta Neuro builds an EEG headset.")
+    stats = run_mod.run(conn, root, events=[LATER], use_llm=False, log=lambda *_: None)
+    assert stats["files_ingested"] == 1
+    assert stats.get("companies_held_for_review", 0) == 0
+    assert _q(conn, "select count(*) from ingest_unmatched")[0][0] == 0
+
+
+def test_review_cli_lists_and_decides(conn, root, capsys):
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "review_unmatched", Path(__file__).resolve().parents[2] / "scripts" / "review_unmatched.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    _run(conn, root)
+    _add_company_folder(root, LATER, "Acme Health AI", "x")
+    run_mod.run(conn, root, events=[LATER], use_llm=False, log=lambda *_: None)
+
+    assert cli.main(["--db-url", TEST_DATABASE_URL]) == 0
+    out = capsys.readouterr().out
+    assert "Acme Health AI" in out and "HW-0001 Acme Health" in out
+    assert cli.main(["--db-url", TEST_DATABASE_URL, "--alias", "Acme Health AI", "--to", "HW-0002"]) == 0
+    beta = _q(conn, "select id::text from companies where company_code = 2")[0][0]
+    assert _q(conn, "select company_id::text from company_aliases")[0][0] == beta
+    assert cli.main(["--db-url", TEST_DATABASE_URL]) == 0
+    assert "Nothing to review" in capsys.readouterr().out
+    assert cli.main(["--db-url", "postgresql://u:p@db.example.supabase.co:5432/postgres",
+                     "--new", "X"]) == 2
+
+
+def test_dry_run_previews_review_list(conn, root, capsys):
+    _run(conn, root)
+    _add_company_folder(root, LATER, "Acme Health AI", "x")
+    _add_company_folder(root, LATER, "Zeta Neuro", "y")
+    run_mod.run(conn, root, events=[LATER], dry_run=True, log=print)
+    out = capsys.readouterr().out
+    assert "Zeta Neuro" in out and "'Acme Health AI' ~ 'Acme Health'" in out
+    assert _q(conn, "select count(*) from ingest_unmatched")[0][0] == 0  # read-only
+
+
+def test_same_value_in_two_periods_on_one_source_is_two_claims(conn):
+    """Migration 002: claims_idem includes period_id (legacy sources are reused
+    across events)."""
+    from kg.claims import _insert_claims
+    from kg.models import ClaimInput
+    from kg.periods import period_for_event
+
+    cid = str(_q(conn, "insert into companies (name_norm, name_raw) values ('x', 'X') returning id")[0][0])
+    src = upsert_source(conn, cid, "company_submitted", None, writer="t")
+    p1, _ = period_for_event(conn, "A (260101)")
+    p2, _ = period_for_event(conn, "B (260201)")
+    claim = [ClaimInput(field="size_of_round_m", value="5")]
+    a = _insert_claims(conn, cid, src, claim, "t", period_id=p1)
+    a2 = _insert_claims(conn, cid, src, claim, "t", period_id=p1)
+    b = _insert_claims(conn, cid, src, claim, "t", period_id=p2)
+    conn.commit()
+    assert a == a2 and a != b
+    assert _q(conn, "select count(*) from claims")[0][0] == 2
+
+
 def test_upsert_source_without_document_id_keeps_old_behaviour(conn):
     cid = _q(conn, "insert into companies (name_norm, name_raw) values ('x', 'X') returning id")[0][0]
     conn.commit()
@@ -259,3 +382,40 @@ def test_refuses_live_db_without_flag(tmp_path, capsys):
                        "postgresql://u:p@db.example.supabase.co:5432/postgres"])
     assert rc == 2
     assert "--yes-live" in capsys.readouterr().out
+
+
+def test_migration_003_renormalizes_and_merges_spelling_duplicates(conn):
+    """Live rows written by the old normalizer kept spaces; 003 fixes them and
+    merges companies that collide under the current rule."""
+    from pathlib import Path
+
+    from kg.models import ClaimInput
+    from kg.claims import write_claims
+
+    def company(norm, raw):
+        return str(_q(conn, "insert into companies (name_norm, name_raw) values (%s, %s) returning id",
+                      norm, raw)[0][0])
+
+    keep = company("3dbiofibr", "3DBioFibR")
+    dup = company("3d biofibr", "3D BioFibR Inc")
+    solo = company("52 north health", "52 North Health")
+    for cid, rel in ((keep, "E/3DBioFibR"), (dup, "E/3D BioFibR Inc")):
+        _q(conn, "insert into company_appearances (company_id, event, relpath) values (%s, 'E', %s) "
+                 "returning id", cid, rel)
+    conn.commit()
+    s_keep = upsert_source(conn, keep, "company_submitted", None, writer="t")
+    s_dup = upsert_source(conn, dup, "company_submitted", None, writer="t")
+    write_claims(conn, keep, s_keep, [ClaimInput(field="country", value="USA")], writer="t")
+    write_claims(conn, dup, s_dup, [ClaimInput(field="country", value="USA")], writer="t")
+
+    sql = (Path(__file__).resolve().parents[2] / "kg" / "migrations"
+           / "003_renormalize_company_names.sql").read_text()
+    for _ in range(2):  # idempotent
+        conn.execute(sql)
+        conn.commit()
+
+    assert sorted(_q(conn, "select name_norm from companies")) == [("3dbiofibr",), ("52northhealth",)]
+    assert _q(conn, "select id::text from companies where name_norm = '52northhealth'")[0][0] == solo
+    assert _q(conn, "select count(*), count(distinct company_id) from claims")[0] == (2, 1)
+    assert _q(conn, "select distinct company_id::text from sources")[0][0] == keep
+    assert _q(conn, "select count(*) from company_appearances where company_id = %s", keep)[0][0] == 2

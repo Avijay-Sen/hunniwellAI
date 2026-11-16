@@ -7,7 +7,16 @@ from __future__ import annotations
 
 from kg.citations import resolve_citation, validate_citations
 from kg.claims import enrich, query, write_claims
-from kg.companies import add_alias, resolve_company, resolve_company_with_aliases
+from kg.companies import (
+    add_alias,
+    approve_alias,
+    approve_new,
+    list_unmatched,
+    match_company,
+    resolve_company,
+    resolve_company_for_ingest,
+    resolve_company_with_aliases,
+)
 from kg.config import apply_migrations, apply_schema, connect
 from kg.documents import (
     finish_run,
@@ -39,6 +48,11 @@ __all__ = [
     "apply_migrations",
     "add_alias",
     "resolve_company_with_aliases",
+    "match_company",
+    "resolve_company_for_ingest",
+    "list_unmatched",
+    "approve_alias",
+    "approve_new",
     "start_run",
     "finish_run",
     "load_documents",

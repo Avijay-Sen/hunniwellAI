@@ -10,7 +10,11 @@ is idempotent and a changed file supersedes (not deletes) its old claims.
     python -m ai.file_ingest.run --root ... --event "JPM 2026 (260115)" --db-url postgresql://...localhost.../hunniwell_test
     python -m ai.file_ingest.run --root ... --yes-live          # writes to SUPABASE_DB_URL
 
-Requires migration 001 (python scripts/kg_apply_schema.py).
+Company folders whose name is close to, but not the same as, an existing
+company are put on the review list and their files are held back until
+scripts/review_unmatched.py decides (alias or new company).
+
+Requires migrations 001-002 (python scripts/kg_apply_schema.py).
 """
 from __future__ import annotations
 
@@ -42,7 +46,7 @@ from ai.file_ingest.scan import (
     iter_files,
     select_event_folders,
 )
-from kg.companies import resolve_company_with_aliases
+from kg.companies import match_company, resolve_company_for_ingest
 from kg.config import get_db_url
 from kg.documents import (
     finish_run,
@@ -83,13 +87,11 @@ def build_claims(entry: FileEntry, text: str, field_claims: list[ClaimInput]) ->
     return field_claims + out
 
 
-def ingest_file(conn, entry: FileEntry, *, run_id: str, period_id: str, as_of, client, stats: Counter) -> None:
+def ingest_file(conn, entry: FileEntry, company_id: str, *, run_id: str, period_id: str, as_of, client,
+                stats: Counter) -> None:
     """Extract and write one file in one transaction. Raises on failure (the
     caller records the error on the document and moves on)."""
     text = extract_text(entry.path)
-    company_id = resolve_company_with_aliases(
-        conn, entry.company_relpath, entry.company_name, entry.event_label
-    )
     common = dict(
         relpath=entry.relpath, run_id=run_id, company_id=company_id, sha256=entry.sha256,
         size_bytes=entry.size_bytes, mtime=entry.mtime, file_kind=file_kind(entry.path),
@@ -134,10 +136,8 @@ def ingest_file(conn, entry: FileEntry, *, run_id: str, period_id: str, as_of, c
     stats["field_claims"] += len(field_claims)
 
 
-def record_skipped(conn, entry: FileEntry, status: str, *, run_id: str, period_id: str, stats: Counter) -> None:
-    company_id = resolve_company_with_aliases(
-        conn, entry.company_relpath, entry.company_name, entry.event_label
-    )
+def record_skipped(conn, entry: FileEntry, company_id: str, status: str, *, run_id: str, period_id: str,
+                   stats: Counter) -> None:
     upsert_document(
         conn, relpath=entry.relpath, run_id=run_id, company_id=company_id,
         size_bytes=entry.size_bytes, mtime=entry.mtime, file_kind=file_kind(entry.path),
@@ -157,6 +157,27 @@ def record_error(conn, entry: FileEntry, err: Exception, *, run_id: str, period_
     )
     conn.commit()
     stats["files_error"] += 1
+
+
+def print_review_preview(conn, scan: ScanResult, log=print) -> None:
+    """Dry run: which company folder names would be held for review or
+    created as new companies (read-only)."""
+    names = sorted({e.company_name for e in scan.to_ingest})
+    try:
+        matches = {n: match_company(conn, n) for n in names}
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        log("Note: migration 002 not applied; company matching preview skipped.")
+        return
+    conn.rollback()
+    held = {n: m for n, m in matches.items() if m.kind in ("review", "pending")}
+    new = [n for n, m in matches.items() if m.kind in ("new", "approved_new")]
+    if new:
+        log(f"New companies that would be created ({len(new)}): {', '.join(new)}")
+    if held:
+        log(f"Held for review — close to an existing company ({len(held)}):")
+        for n, m in held.items():
+            log(f"  {n!r} ~ {m.candidate_name!r} (score {m.score})")
 
 
 def print_plan(scan: ScanResult, max_bytes: int) -> None:
@@ -210,6 +231,8 @@ def run(
 
     if dry_run:
         print_plan(scan, max_bytes)
+        if conn is not None and scan.to_ingest:
+            print_review_preview(conn, scan, log)
         return {"dry_run": True, "new": len(scan.new), "changed": len(scan.changed),
                 "unchanged": len(scan.unchanged), "deleted": len(scan.deleted_relpaths)}
 
@@ -235,16 +258,33 @@ def run(
         stats["files_unchanged"] = len(scan.unchanged)
 
         todo = scan.to_ingest[:limit] if limit else scan.to_ingest
+        companies: dict[str, Optional[str]] = {}  # company folder relpath -> id (None = held)
         for i, entry in enumerate(todo, 1):
             period_id, event_date = periods[entry.event_folder]
             as_of = event_date or entry.mtime.date()
             skipped = is_skipped(entry, max_bytes)
             try:
+                if entry.company_relpath not in companies:
+                    company_id, m = resolve_company_for_ingest(
+                        conn, entry.company_relpath, entry.company_name, entry.event_label, run_id=run_id,
+                    )
+                    companies[entry.company_relpath] = company_id
+                    if company_id is None:
+                        stats["companies_held_for_review"] += 1
+                        log(f"  HOLD {entry.company_name!r}: close to existing {m.candidate_name!r} "
+                            f"(score {m.score}); run scripts/review_unmatched.py")
+                    elif m.kind in ("new", "approved_new"):
+                        stats["companies_created"] += 1
+                company_id = companies[entry.company_relpath]
+                if company_id is None:
+                    stats["files_held_for_review"] += 1
+                    continue
                 if skipped:
-                    record_skipped(conn, entry, skipped, run_id=run_id, period_id=period_id, stats=stats)
+                    record_skipped(conn, entry, company_id, skipped, run_id=run_id, period_id=period_id,
+                                   stats=stats)
                     continue
                 log(f"[{i}/{len(todo)}] {entry.relpath}")
-                ingest_file(conn, entry, run_id=run_id, period_id=period_id, as_of=as_of,
+                ingest_file(conn, entry, company_id, run_id=run_id, period_id=period_id, as_of=as_of,
                             client=client, stats=stats)
             except Exception as e:  # one bad file never aborts the run
                 log(f"  ERROR {type(e).__name__}: {e}")
@@ -321,6 +361,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             conn.close()
     if not args.dry_run:
         print("Run finished:", {k: v for k, v in sorted(stats.items())})
+        if stats.get("companies_held_for_review"):
+            print(f"{stats['companies_held_for_review']} company name(s) need review; their files were "
+                  "not ingested. Run: python scripts/review_unmatched.py")
         return 0 if stats.get("status") == "succeeded" else 1
     return 0
 

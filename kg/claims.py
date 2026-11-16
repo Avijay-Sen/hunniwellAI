@@ -15,17 +15,22 @@ def _new_claim_id() -> str:
     return "clm_" + uuid4().hex
 
 
-def _existing_active_ids(conn, company_id, source_id, claims) -> list:
+def _existing_active_ids(conn, company_id, source_id, claims, period_id=None) -> list:
     """For each claim, the id of an identical ACTIVE claim already stored for
-    this (company, source), else None. Lets re-ingests skip embedding."""
+    this (company, source[, period]), else None. Lets re-ingests skip embedding.
+
+    The period filter is only added when period_id is given, so callers that
+    don't tag periods keep working on a database without migration 001."""
     if source_id is None:
         return [None] * len(claims)
+    sql = ("select id, coalesce(field, ''), md5(value) from claims "
+           "where company_id = %s and source_id = %s and status = 'active'")
+    params: list = [company_id, source_id]
+    if period_id is not None:
+        sql += " and period_id = %s"
+        params.append(period_id)
     with conn.cursor() as cur:
-        cur.execute(
-            "select id, coalesce(field, ''), md5(value) from claims "
-            "where company_id = %s and source_id = %s and status = 'active'",
-            (company_id, source_id),
-        )
+        cur.execute(sql, params)
         existing = {(f, h): cid for cid, f, h in cur.fetchall()}
     if not existing:
         return [None] * len(claims)
@@ -45,9 +50,10 @@ def _insert_claims(conn, company_id, source_id, claims, writer, *, period_id=Non
     no `kg.claims.embed` symbol.
 
     Idempotency is enforced by the partial unique index claims_idem on
-    (company_id, coalesce(field,''), md5(value), source_id) where status='active'.
-    A re-insert of the same (field, value, source) returns the existing id and
-    creates no duplicate row.
+    (company_id, coalesce(field,''), md5(value), source_id, period_id) where
+    status='active' (migration 002; before it, the same key without period_id).
+    A re-insert of the same (field, value, source, period) returns the existing
+    id and creates no duplicate row.
 
     Shared by write_claims (which commits) and enrich (which commits once,
     atomically, after the supersede UPDATE).
@@ -55,7 +61,7 @@ def _insert_claims(conn, company_id, source_id, claims, writer, *, period_id=Non
     if not claims:
         return []
 
-    known = _existing_active_ids(conn, company_id, source_id, claims)
+    known = _existing_active_ids(conn, company_id, source_id, claims, period_id)
     to_embed = [c.value for c, k in zip(claims, known) if k is None]
     vec_iter = iter(embeddings.embed(to_embed) if to_embed else [])
 
@@ -72,20 +78,16 @@ def _insert_claims(conn, company_id, source_id, claims, writer, *, period_id=Non
             vec = next(vec_iter)
             new_id = _new_claim_id()
             cur.execute(
-                # The ON CONFLICT target+predicate below MUST mirror the schema's
-                # claims_idem partial-index expression
-                #   (company_id, coalesce(field,''), md5(value), source_id)
-                # and predicate  WHERE status = 'active'  EXACTLY. Any divergence
-                # makes Postgres raise: "there is no unique or exclusion constraint
-                # matching the ON CONFLICT specification".
+                # Bare ON CONFLICT DO NOTHING (no target): it honours whichever
+                # claims_idem definition the database has (with period_id after
+                # migration 002, without it before), so code and schema can't
+                # drift apart. The only other unique key is the random id.
                 f"""
                 insert into claims
                     (id, company_id, field, value, source_id, writer, confidence, embedding, status{extra_names})
                 values
                     (%s, %s, %s, %s, %s, %s, %s, %s, 'active'{extra_marks})
-                on conflict (company_id, coalesce(field,''), md5(value), source_id)
-                    where status = 'active'
-                do nothing
+                on conflict do nothing
                 returning id
                 """,
                 (
@@ -104,18 +106,21 @@ def _insert_claims(conn, company_id, source_id, claims, writer, *, period_id=Non
             if row is not None:
                 out.append(row[0])
             else:
-                # Conflict: an active row already exists; fetch its id.
-                cur.execute(
-                    """
+                # Conflict: an active row already exists; fetch its id
+                # (preferring one in the same period).
+                sql = """
                     select id from claims
                     where company_id = %s
                       and coalesce(field, '') = coalesce(%s, '')
                       and md5(value) = md5(%s)
-                      and source_id = %s
+                      and source_id is not distinct from %s
                       and status = 'active'
-                    """,
-                    (company_id, claim.field, claim.value, source_id),
-                )
+                """
+                params = [company_id, claim.field, claim.value, source_id]
+                if period_id is not None:
+                    sql += " order by (period_id = %s) desc nulls last"
+                    params.append(period_id)
+                cur.execute(sql + " limit 1", params)
                 out.append(cur.fetchone()[0])
     return out
 
